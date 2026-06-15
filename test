@@ -1,0 +1,345 @@
+let
+    // Change this to your network file path.
+    // Prefer UNC format like \\server\folder\file.xlsx instead of mapped drive like Z:\folder\file.xlsx
+    FilePath = "\\server\folder\file.xlsx",
+
+    // Load workbook
+    Workbook =
+        Excel.Workbook(
+            File.Contents(FilePath),
+            null,
+            true
+        ),
+
+    // Keep worksheets only
+    SheetsOnly =
+        Table.SelectRows(
+            Workbook,
+            each [Kind] = "Sheet"
+                and (try [Hidden] otherwise false) <> true
+        ),
+
+    // Keep only sheet name and nested sheet data
+    KeptNameAndData =
+        Table.SelectColumns(
+            SheetsOnly,
+            {"Name", "Data"}
+        ),
+
+    // These are the metadata fields to pull from Column 3,
+    // with the adjacent value from Column 4
+    FieldsToExtract =
+        {
+            "Position",
+            "Generic Job Profile",
+            "Job Family or Capability Group",
+            "Job Profile Identification"
+        },
+
+    // Simple reusable text cleaner
+    CleanText = (InputValue as any) as nullable text =>
+        let
+            Output =
+                if InputValue = null then
+                    null
+                else
+                    let
+                        AsText = Text.From(InputValue),
+                        Cleaned = Text.Trim(Text.Clean(AsText))
+                    in
+                        if Cleaned = "" then null else Cleaned
+        in
+            Output,
+
+    // Function to take columns 3 and 4 from each sheet
+    ExtractColumns3And4 = (SheetName as text, SheetData as table) as table =>
+        let
+            ColumnNames =
+                Table.ColumnNames(SheetData),
+
+            HasEnoughColumns =
+                List.Count(ColumnNames) >= 4,
+
+            Output =
+                if HasEnoughColumns = false then
+                    #table(
+                        {"Source Sheet", "Label", "Value"},
+                        {}
+                    )
+                else
+                    let
+                        Column3Name =
+                            ColumnNames{2},
+
+                        Column4Name =
+                            ColumnNames{3},
+
+                        SelectedColumns =
+                            Table.SelectColumns(
+                                SheetData,
+                                {Column3Name, Column4Name},
+                                MissingField.UseNull
+                            ),
+
+                        RenamedColumns =
+                            Table.RenameColumns(
+                                SelectedColumns,
+                                {
+                                    {Column3Name, "Label"},
+                                    {Column4Name, "Value"}
+                                }
+                            ),
+
+                        AddedSourceSheet =
+                            Table.AddColumn(
+                                RenamedColumns,
+                                "Source Sheet",
+                                each SheetName,
+                                type text
+                            ),
+
+                        ReorderedColumns =
+                            Table.ReorderColumns(
+                                AddedSourceSheet,
+                                {"Source Sheet", "Label", "Value"}
+                            ),
+
+                        CleanedColumns =
+                            Table.TransformColumns(
+                                ReorderedColumns,
+                                {
+                                    {"Label", each CleanText(_), type nullable text},
+                                    {"Value", each CleanText(_), type nullable text}
+                                }
+                            )
+                    in
+                        CleanedColumns
+        in
+            Output,
+
+    // Apply function to every sheet
+    AddedExtractedColumns =
+        Table.AddColumn(
+            KeptNameAndData,
+            "Extracted Data",
+            each ExtractColumns3And4(
+                Text.From([Name]),
+                [Data]
+            ),
+            type table
+        ),
+
+    // Combine all sheets into one flat table:
+    // Source Sheet | Label | Value
+    CombinedExtracted =
+        Table.Combine(
+            AddedExtractedColumns[Extracted Data]
+        ),
+
+    // =========================
+    // Metadata extraction
+    // =========================
+
+    MetadataRows =
+        Table.SelectRows(
+            CombinedExtracted,
+            each List.Contains(FieldsToExtract, [Label])
+        ),
+
+    MetadataKeptColumns =
+        Table.SelectColumns(
+            MetadataRows,
+            {"Source Sheet", "Label", "Value"}
+        ),
+
+    MetadataPivoted =
+        Table.Pivot(
+            MetadataKeptColumns,
+            FieldsToExtract,
+            "Label",
+            "Value",
+            each try List.First(List.RemoveNulls(_)) otherwise null
+        ),
+
+    MetadataWithAllColumns =
+        List.Accumulate(
+            FieldsToExtract,
+            MetadataPivoted,
+            (CurrentTable, CurrentField) =>
+                if List.Contains(Table.ColumnNames(CurrentTable), CurrentField) then
+                    CurrentTable
+                else
+                    Table.AddColumn(
+                        CurrentTable,
+                        CurrentField,
+                        each null,
+                        type nullable text
+                    )
+        ),
+
+    MetadataFinal =
+        Table.SelectColumns(
+            MetadataWithAllColumns,
+            {"Source Sheet"} & FieldsToExtract
+        ),
+
+    // =========================
+    // Skills extraction
+    // =========================
+
+    GroupedBySheet =
+        Table.Group(
+            CombinedExtracted,
+            {"Source Sheet"},
+            {
+                {
+                    "Skills Data",
+                    each
+                        let
+                            SheetRows =
+                                Table.AddIndexColumn(
+                                    _,
+                                    "RowIndex",
+                                    0,
+                                    1,
+                                    Int64.Type
+                                ),
+
+                            SkillsStartRows =
+                                Table.SelectRows(
+                                    SheetRows,
+                                    each [Label] <> null
+                                        and Text.Upper(Text.Trim([Label])) = "SKILLS"
+                                ),
+
+                            SkillsStartIndex =
+                                try SkillsStartRows{0}[RowIndex] otherwise null,
+
+                            RoleSpecificDimensionsRows =
+                                if SkillsStartIndex = null then
+                                    #table({"RowIndex"}, {})
+                                else
+                                    Table.SelectRows(
+                                        SheetRows,
+                                        each [RowIndex] > SkillsStartIndex
+                                            and [Label] <> null
+                                            and Text.Upper(Text.Trim([Label])) = "ROLE SPECIFIC DIMENSIONS"
+                                    ),
+
+                            SkillsEndIndex =
+                                try RoleSpecificDimensionsRows{0}[RowIndex] otherwise null,
+
+                            SkillRows =
+                                if SkillsStartIndex = null then
+                                    #table({"Skill"}, {})
+                                else
+                                    Table.SelectRows(
+                                        SheetRows,
+                                        each [RowIndex] > SkillsStartIndex
+                                            and (
+                                                SkillsEndIndex = null
+                                                or [RowIndex] < SkillsEndIndex
+                                            )
+                                    ),
+
+                            KeptSkillColumn =
+                                if SkillsStartIndex = null then
+                                    #table({"Skill"}, {})
+                                else
+                                    Table.RenameColumns(
+                                        Table.SelectColumns(
+                                            SkillRows,
+                                            {"Label"}
+                                        ),
+                                        {{"Label", "Skill"}}
+                                    ),
+
+                            CleanedSkills =
+                                Table.TransformColumns(
+                                    KeptSkillColumn,
+                                    {
+                                        {"Skill", each CleanText(_), type nullable text}
+                                    }
+                                ),
+
+                            RemovedBlankSkills =
+                                Table.SelectRows(
+                                    CleanedSkills,
+                                    each [Skill] <> null
+                                        and Text.Trim([Skill]) <> ""
+                                        and Text.Upper(Text.Trim([Skill])) <> "SKILLS"
+                                        and Text.Upper(Text.Trim([Skill])) <> "ROLE SPECIFIC DIMENSIONS"
+                                ),
+
+                            DistinctSkills =
+                                Table.Distinct(RemovedBlankSkills),
+
+                            Output =
+                                if Table.RowCount(DistinctSkills) = 0 then
+                                    #table({"Skill"}, {{null}})
+                                else
+                                    DistinctSkills
+                        in
+                            Output,
+                    type table
+                }
+            }
+        ),
+
+    ExpandedSkills =
+        Table.ExpandTableColumn(
+            GroupedBySheet,
+            "Skills Data",
+            {"Skill"},
+            {"Skill"}
+        ),
+
+    // =========================
+    // Join metadata to skills
+    // =========================
+
+    MergedMetadata =
+        Table.NestedJoin(
+            ExpandedSkills,
+            {"Source Sheet"},
+            MetadataFinal,
+            {"Source Sheet"},
+            "Metadata",
+            JoinKind.LeftOuter
+        ),
+
+    ExpandedMetadata =
+        Table.ExpandTableColumn(
+            MergedMetadata,
+            "Metadata",
+            FieldsToExtract,
+            FieldsToExtract
+        ),
+
+    ReorderedFinalColumns =
+        Table.ReorderColumns(
+            ExpandedMetadata,
+            {
+                "Source Sheet",
+                "Position",
+                "Generic Job Profile",
+                "Job Family or Capability Group",
+                "Job Profile Identification",
+                "Skill"
+            }
+        ),
+
+    Final =
+        Table.TransformColumnTypes(
+            ReorderedFinalColumns,
+            {
+                {"Source Sheet", type text},
+                {"Position", type text},
+                {"Generic Job Profile", type text},
+                {"Job Family or Capability Group", type text},
+                {"Job Profile Identification", type text},
+                {"Skill", type text}
+            }
+        )
+in
+    Final
