@@ -40,7 +40,8 @@ let
     SkillHeaderLabels =
         {
             "skills",
-            "evidence based skills"
+            "evidence based skills",
+            "core technical skills"
         },
 
     // Lowercase labels that indicate the end of the skills section
