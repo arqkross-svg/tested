@@ -1,123 +1,1579 @@
-WITH RagValues AS
-(
-    SELECT
-        t.Capability,
-        t.ToolName,
-        rag.RagValue
-    FROM dbo.ToolHealth AS t
+"""
+Transformation QA Report
+========================
 
-    CROSS APPLY
-    (
-        VALUES
-            (t.RAG_Column_1),
-            (t.RAG_Column_2),
-            (t.RAG_Column_3),
-            (t.RAG_Column_4),
-            (t.RAG_Column_5),
-            (t.RAG_Column_6),
-            (t.RAG_Column_7),
-            (t.RAG_Column_8),
-            (t.RAG_Column_9),
-            (t.RAG_Column_10),
-            (t.RAG_Column_11)
-    ) AS rag(RagValue)
-),
+Compares previous and current versions of:
+  1. Programme Demand (Demand.xlsx)
+  2. Load / Capability (LoadCap.xlsx)
+  3. SharpCloud Skills Data (SCSkillsData.xlsx)
 
-CapabilityScores AS
-(
-    SELECT
-        Capability,
+It also reconciles Programme Demand against LoadCap by Year Quarter + HoC.
 
-        SUM(
-            CASE
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('G', 'GREEN')
-                    THEN 3
+Run normally for file-picker dialogs:
+    python transformation_qa_report.py
 
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('A', 'AMBER')
-                    THEN 2
+Required packages:
+    pip install pandas openpyxl numpy
 
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('R', 'RED')
-                    THEN 0
+Optional command-line use is supported. Run:
+    python transformation_qa_report.py --help
+"""
 
-                /* Null or empty values count as Blank */
-                ELSE 1
-            END
-        ) AS AchievedPoints,
+from __future__ import annotations
 
-        COUNT(*) * 3 AS MaximumPoints,
+import argparse
+import html
+import math
+import sys
+import traceback
+import webbrowser
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-        SUM(
-            CASE
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('G', 'GREEN')
-                    THEN 1
-                ELSE 0
-            END
-        ) AS GreenCount,
+try:
+    import numpy as np
+    import pandas as pd
+except ImportError as exc:
+    raise SystemExit(
+        "Missing dependency. Install the required packages with:\n"
+        "    pip install pandas openpyxl numpy\n"
+        f"\nOriginal error: {exc}"
+    ) from exc
 
-        SUM(
-            CASE
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('A', 'AMBER')
-                    THEN 1
-                ELSE 0
-            END
-        ) AS AmberCount,
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:
+    tk = None
+    filedialog = None
+    messagebox = None
 
-        SUM(
-            CASE
-                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
-                    IN ('R', 'RED')
-                    THEN 1
-                ELSE 0
-            END
-        ) AS RedCount,
 
-        SUM(
-            CASE
-                WHEN NULLIF(LTRIM(RTRIM(RagValue)), '') IS NULL
-                    THEN 1
-                ELSE 0
-            END
-        ) AS BlankCount
+# =============================================================================
+# USER-ADJUSTABLE SETTINGS
+# =============================================================================
 
-    FROM RagValues
+# A 2x rule flags a value whose absolute magnitude becomes more than twice,
+# or less than half, its previous magnitude. Changes to/from zero and sign
+# changes are also flagged.
+RATIO_THRESHOLD = 2.0
 
-    GROUP BY
-        Capability
+# Skills values are flagged when their absolute percentage change exceeds 25%.
+SKILLS_PERCENT_THRESHOLD = 25.0
+
+# Demand reconciliation passes when the two aggregated totals differ by no more
+# than this number of FTE.
+RECONCILIATION_TOLERANCE_FTE = 0.01
+
+# Floating-point tolerance used to decide whether a numeric value changed.
+NUMERIC_COMPARISON_TOLERANCE = 1e-9
+
+# Limits each displayed HTML table to prevent unexpectedly enormous reports.
+# Counts in the summary still use the full results.
+MAX_HTML_ROWS_PER_TABLE = 5000
+
+# Automatically open the finished report in the default browser.
+AUTO_OPEN_REPORT = True
+
+# Treat surrounding whitespace in key columns as insignificant.
+STRIP_KEY_WHITESPACE = True
+
+
+# =============================================================================
+# DATASET CONFIGURATION
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class ValueRule:
+    rule_type: str  # "ratio" or "percent"
+    threshold: float
+    aggregation: str  # "sum" or "mean"
+
+
+@dataclass(frozen=True)
+class DatasetConfig:
+    code: str
+    name: str
+    expected_filename: str
+    keys: Tuple[str, ...]
+    entity_column: str
+    values: Dict[str, ValueRule]
+
+
+DATASETS: Tuple[DatasetConfig, ...] = (
+    DatasetConfig(
+        code="programme_demand",
+        name="Programme Demand",
+        expected_filename="Demand.xlsx",
+        keys=("Year Quarter", "HoC", "Job Profile", "Programme"),
+        entity_column="Job Profile",
+        values={
+            "Demand (FTE)": ValueRule("ratio", RATIO_THRESHOLD, "sum"),
+        },
+    ),
+    DatasetConfig(
+        code="loadcap",
+        name="LoadCap",
+        expected_filename="LoadCap.xlsx",
+        keys=("Year Quarter", "Job Profile", "HoC"),
+        entity_column="Job Profile",
+        values={
+            "JP Capability(FTE)": ValueRule("ratio", RATIO_THRESHOLD, "sum"),
+            "JP Demand (FTE)": ValueRule("ratio", RATIO_THRESHOLD, "sum"),
+            "JP Delta": ValueRule("ratio", RATIO_THRESHOLD, "sum"),
+        },
+    ),
+    DatasetConfig(
+        code="skills",
+        name="SC Skills Data",
+        expected_filename="SCSkillsData.xlsx",
+        keys=("Job Family", "Role Profile", "Skill"),
+        entity_column="Role Profile",
+        values={
+            "Avg_Skill": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "mean"),
+            "Count_Level_1": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+            "Count_Level_2": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+            "Count_Level_3": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+            "Count_Level_4": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+            "Count_Dev_Phase": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+            "Count_NA": ValueRule("percent", SKILLS_PERCENT_THRESHOLD, "sum"),
+        },
+    ),
 )
 
-SELECT
-    Capability,
-    GreenCount,
-    AmberCount,
-    RedCount,
-    BlankCount,
-    AchievedPoints,
-    MaximumPoints,
+RECONCILIATION_KEYS = ("Year Quarter", "HoC")
 
-    CAST(
-        AchievedPoints * 100.0
-        / NULLIF(MaximumPoints, 0)
-        AS DECIMAL(5, 2)
-    ) AS CapabilityHealthPercentage,
 
-    CASE
-        WHEN AchievedPoints * 100.0
-             / NULLIF(MaximumPoints, 0) >= 75
-            THEN 'Green'
+# =============================================================================
+# RESULT CONTAINERS
+# =============================================================================
 
-        WHEN AchievedPoints * 100.0
-             / NULLIF(MaximumPoints, 0) >= 50
-            THEN 'Amber'
 
-        ELSE 'Red'
-    END AS CapabilityRAG
+@dataclass
+class LoadedDataset:
+    config: DatasetConfig
+    snapshot: str
+    path: Path
+    sheet_name: str
+    raw_row_count: int
+    prepared: pd.DataFrame
+    aggregated: pd.DataFrame
+    duplicates: pd.DataFrame
+    blank_key_issues: pd.DataFrame
+    numeric_issues: pd.DataFrame
 
-FROM CapabilityScores
 
-ORDER BY
-    Capability;
+@dataclass
+class ComparisonResult:
+    config: DatasetConfig
+    previous: LoadedDataset
+    current: LoadedDataset
+    missing_rows: pd.DataFrame
+    new_rows: pd.DataFrame
+    missing_entities: pd.DataFrame
+    new_entities: pd.DataFrame
+    all_value_changes: pd.DataFrame
+    flagged_value_changes: pd.DataFrame
+    matched_row_count: int
+
+
+# =============================================================================
+# GUI HELPERS
+# =============================================================================
+
+
+def create_hidden_root() -> Optional[Any]:
+    if tk is None:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+    return root
+
+
+def choose_excel_file(root: Any, title: str, expected_filename: str) -> Path:
+    if filedialog is None:
+        raise RuntimeError("Tkinter file dialogs are unavailable in this Python installation.")
+
+    selected = filedialog.askopenfilename(
+        parent=root,
+        title=title,
+        filetypes=[
+            (f"Expected file ({expected_filename})", expected_filename),
+            ("Excel workbooks", "*.xlsx *.xlsm *.xls"),
+            ("All files", "*.*"),
+        ],
+    )
+    if not selected:
+        raise UserCancelledError(f"No file selected for: {title}")
+    return Path(selected)
+
+
+def choose_output_file(root: Any) -> Path:
+    if filedialog is None:
+        raise RuntimeError("Tkinter file dialogs are unavailable in this Python installation.")
+
+    default_name = f"Transformation_QA_Report_{datetime.now():%Y%m%d_%H%M%S}.html"
+    selected = filedialog.asksaveasfilename(
+        parent=root,
+        title="Choose where to save the QA HTML report",
+        defaultextension=".html",
+        initialfile=default_name,
+        filetypes=[("HTML report", "*.html"), ("All files", "*.*")],
+    )
+    if not selected:
+        raise UserCancelledError("No report output location selected.")
+    return Path(selected)
+
+
+def choose_sheet(root: Any, workbook_path: Path, label: str, requested_sheet: Optional[str]) -> str:
+    excel_file = pd.ExcelFile(workbook_path)
+    sheets = excel_file.sheet_names
+
+    if requested_sheet is not None:
+        if requested_sheet not in sheets:
+            raise ValueError(
+                f"Sheet '{requested_sheet}' was not found in {workbook_path.name}. "
+                f"Available sheets: {', '.join(sheets)}"
+            )
+        return requested_sheet
+
+    if len(sheets) == 1:
+        return sheets[0]
+
+    if root is None or tk is None:
+        raise ValueError(
+            f"{workbook_path.name} contains multiple sheets. Specify one using the appropriate "
+            f"command-line --*-sheet argument. Available sheets: {', '.join(sheets)}"
+        )
+
+    dialog = tk.Toplevel(root)
+    dialog.title(f"Select sheet: {label}")
+    dialog.resizable(False, False)
+    try:
+        dialog.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+    selection = tk.StringVar(value=sheets[0])
+    cancelled = {"value": True}
+
+    tk.Label(
+        dialog,
+        text=f"{workbook_path.name} contains multiple worksheets.\nSelect the worksheet for {label}:",
+        justify="left",
+        padx=16,
+        pady=12,
+    ).pack(anchor="w")
+
+    option_menu = tk.OptionMenu(dialog, selection, *sheets)
+    option_menu.config(width=max(25, min(60, max(len(s) for s in sheets) + 4)))
+    option_menu.pack(padx=16, pady=(0, 12), fill="x")
+
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(padx=16, pady=(0, 16), fill="x")
+
+    def accept() -> None:
+        cancelled["value"] = False
+        dialog.destroy()
+
+    def cancel() -> None:
+        dialog.destroy()
+
+    tk.Button(button_frame, text="Use this sheet", command=accept, width=16).pack(side="left")
+    tk.Button(button_frame, text="Cancel", command=cancel, width=10).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel)
+    dialog.grab_set()
+    dialog.wait_visibility()
+    dialog.focus_force()
+    root.wait_window(dialog)
+
+    if cancelled["value"]:
+        raise UserCancelledError(f"No worksheet selected for {label}.")
+    return selection.get()
+
+
+class UserCancelledError(Exception):
+    """Raised when a user cancels a file or sheet selection dialog."""
+
+
+# =============================================================================
+# DATA LOADING AND VALIDATION
+# =============================================================================
+
+
+def normalise_headers(columns: Sequence[Any]) -> List[str]:
+    return [str(column).strip() for column in columns]
+
+
+def clean_key_value(value: Any) -> Any:
+    if pd.isna(value):
+        return pd.NA
+    if isinstance(value, str):
+        cleaned = value.strip() if STRIP_KEY_WHITESPACE else value
+        return pd.NA if cleaned == "" else cleaned
+    return value
+
+
+def require_columns(df: pd.DataFrame, config: DatasetConfig, path: Path, sheet_name: str) -> None:
+    required = list(config.keys) + list(config.values.keys())
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{config.name}: required columns are missing from '{path.name}' / sheet '{sheet_name}':\n"
+            f"  - " + "\n  - ".join(missing) + "\n\n"
+            f"Columns found:\n  - " + "\n  - ".join(map(str, df.columns))
+        )
+
+
+def aggregate_prepared_data(df: pd.DataFrame, config: DatasetConfig) -> pd.DataFrame:
+    aggregation_functions: Dict[str, Callable[[pd.Series], float]] = {}
+
+    for column, rule in config.values.items():
+        if rule.aggregation == "sum":
+            aggregation_functions[column] = lambda series: series.sum(min_count=1)
+        elif rule.aggregation == "mean":
+            aggregation_functions[column] = lambda series: series.mean()
+        else:
+            raise ValueError(f"Unsupported aggregation '{rule.aggregation}' for {config.name}.{column}")
+
+    aggregated = (
+        df.groupby(list(config.keys), dropna=False, sort=False)
+        .agg(aggregation_functions)
+        .reset_index()
+    )
+    return aggregated
+
+
+def load_dataset(
+    config: DatasetConfig,
+    snapshot: str,
+    path: Path,
+    sheet_name: str,
+) -> LoadedDataset:
+    try:
+        df = pd.read_excel(path, sheet_name=sheet_name)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not read {config.name} {snapshot.lower()} file:\n{path}\nSheet: {sheet_name}\n\n{exc}"
+        ) from exc
+
+    df.columns = normalise_headers(df.columns)
+    require_columns(df, config, path, sheet_name)
+
+    raw_row_count = len(df)
+    relevant_columns = list(config.keys) + list(config.values.keys())
+    prepared = df.loc[:, relevant_columns].copy()
+    prepared.insert(0, "Source Excel Row", np.arange(2, len(prepared) + 2))
+
+    for key in config.keys:
+        prepared[key] = prepared[key].map(clean_key_value)
+
+    blank_mask = prepared[list(config.keys)].isna().any(axis=1)
+    blank_key_issues = prepared.loc[
+        blank_mask,
+        ["Source Excel Row", *config.keys, *config.values.keys()],
+    ].copy()
+    if not blank_key_issues.empty:
+        blank_columns = []
+        for _, row in blank_key_issues.iterrows():
+            missing_for_row = [key for key in config.keys if pd.isna(row[key])]
+            blank_columns.append(", ".join(missing_for_row))
+        blank_key_issues.insert(1, "Blank Key Columns", blank_columns)
+        blank_key_issues.insert(0, "Snapshot", snapshot)
+
+    numeric_issue_frames: List[pd.DataFrame] = []
+    for value_column in config.values:
+        original = prepared[value_column].copy()
+        converted = pd.to_numeric(original, errors="coerce")
+        invalid_mask = original.notna() & converted.isna()
+
+        if invalid_mask.any():
+            issues = prepared.loc[invalid_mask, ["Source Excel Row", *config.keys]].copy()
+            issues.insert(0, "Snapshot", snapshot)
+            issues["Value Column"] = value_column
+            issues["Invalid Value"] = original.loc[invalid_mask].astype(str).values
+            numeric_issue_frames.append(issues)
+
+        prepared[value_column] = converted
+
+    numeric_issues = (
+        pd.concat(numeric_issue_frames, ignore_index=True)
+        if numeric_issue_frames
+        else pd.DataFrame(columns=["Snapshot", "Source Excel Row", *config.keys, "Value Column", "Invalid Value"])
+    )
+
+    duplicate_mask = prepared.duplicated(subset=list(config.keys), keep=False)
+    duplicate_rows = prepared.loc[
+        duplicate_mask,
+        ["Source Excel Row", *config.keys, *config.values.keys()],
+    ].copy()
+
+    if duplicate_rows.empty:
+        duplicates = pd.DataFrame(columns=["Snapshot", *config.keys, "Duplicate Row Count"])
+    else:
+        duplicate_counts = (
+            duplicate_rows.groupby(list(config.keys), dropna=False)
+            .size()
+            .rename("Duplicate Row Count")
+            .reset_index()
+        )
+        duplicates = duplicate_rows.merge(duplicate_counts, on=list(config.keys), how="left")
+        duplicates.insert(0, "Snapshot", snapshot)
+        duplicates = duplicates.sort_values(
+            ["Duplicate Row Count", *config.keys],
+            ascending=[False] + [True] * len(config.keys),
+            kind="stable",
+        ).reset_index(drop=True)
+
+    # Keep rows with blank keys in QA issue tables, but exclude them from key-based
+    # comparisons because they cannot form a reliable identifier.
+    comparison_ready = prepared.loc[~blank_mask, relevant_columns].copy()
+    aggregated = aggregate_prepared_data(comparison_ready, config)
+
+    return LoadedDataset(
+        config=config,
+        snapshot=snapshot,
+        path=path,
+        sheet_name=sheet_name,
+        raw_row_count=raw_row_count,
+        prepared=prepared,
+        aggregated=aggregated,
+        duplicates=duplicates,
+        blank_key_issues=blank_key_issues,
+        numeric_issues=numeric_issues,
+    )
+
+
+# =============================================================================
+# COMPARISON LOGIC
+# =============================================================================
+
+
+def numeric_values_equal(previous: pd.Series, current: pd.Series) -> pd.Series:
+    both_missing = previous.isna() & current.isna()
+    one_missing = previous.isna() ^ current.isna()
+    numeric_close = pd.Series(False, index=previous.index)
+
+    valid = ~(previous.isna() | current.isna())
+    if valid.any():
+        numeric_close.loc[valid] = np.isclose(
+            previous.loc[valid].astype(float),
+            current.loc[valid].astype(float),
+            rtol=0.0,
+            atol=NUMERIC_COMPARISON_TOLERANCE,
+            equal_nan=True,
+        )
+    return (both_missing | numeric_close) & ~one_missing
+
+
+def calculate_change_metrics(previous: Any, current: Any) -> Dict[str, Any]:
+    previous_missing = pd.isna(previous)
+    current_missing = pd.isna(current)
+
+    if previous_missing or current_missing:
+        return {
+            "Absolute Change": np.nan,
+            "Percentage Change": np.nan,
+            "Magnitude Ratio": np.nan,
+        }
+
+    previous_float = float(previous)
+    current_float = float(current)
+    absolute_change = current_float - previous_float
+
+    if math.isclose(previous_float, 0.0, abs_tol=NUMERIC_COMPARISON_TOLERANCE):
+        percentage_change = np.nan
+        magnitude_ratio = np.inf if not math.isclose(current_float, 0.0, abs_tol=NUMERIC_COMPARISON_TOLERANCE) else 1.0
+    else:
+        percentage_change = (absolute_change / abs(previous_float)) * 100.0
+        magnitude_ratio = abs(current_float) / abs(previous_float)
+
+    return {
+        "Absolute Change": absolute_change,
+        "Percentage Change": percentage_change,
+        "Magnitude Ratio": magnitude_ratio,
+    }
+
+
+def evaluate_rule(previous: Any, current: Any, rule: ValueRule) -> Tuple[bool, str, float]:
+    previous_missing = pd.isna(previous)
+    current_missing = pd.isna(current)
+
+    if previous_missing and current_missing:
+        return False, "Both values blank", 0.0
+    if previous_missing and not current_missing:
+        return True, "Previous value blank", float("inf")
+    if current_missing and not previous_missing:
+        return True, "Current value blank", float("inf")
+
+    previous_float = float(previous)
+    current_float = float(current)
+    previous_zero = math.isclose(previous_float, 0.0, abs_tol=NUMERIC_COMPARISON_TOLERANCE)
+    current_zero = math.isclose(current_float, 0.0, abs_tol=NUMERIC_COMPARISON_TOLERANCE)
+
+    if previous_zero and current_zero:
+        return False, "No change", 0.0
+    if previous_zero and not current_zero:
+        return True, "Changed from zero", float("inf")
+    if not previous_zero and current_zero:
+        return True, "Changed to zero", float("inf")
+
+    sign_changed = np.sign(previous_float) != np.sign(current_float)
+
+    if rule.rule_type == "ratio":
+        ratio = abs(current_float) / abs(previous_float)
+        upper_flag = ratio > rule.threshold
+        lower_flag = ratio < (1.0 / rule.threshold)
+
+        if sign_changed:
+            return True, "Sign changed", max(ratio, 1.0 / ratio if ratio else float("inf"))
+        if upper_flag:
+            return True, f"Magnitude increased beyond {rule.threshold:g}x", ratio
+        if lower_flag:
+            inverse_ratio = 1.0 / ratio if ratio else float("inf")
+            return True, f"Magnitude decreased beyond {rule.threshold:g}x", inverse_ratio
+        return False, "Within ratio threshold", max(ratio, 1.0 / ratio if ratio else float("inf"))
+
+    if rule.rule_type == "percent":
+        percent_change = ((current_float - previous_float) / abs(previous_float)) * 100.0
+        severity = abs(percent_change) / rule.threshold if rule.threshold else abs(percent_change)
+
+        if sign_changed:
+            return True, "Sign changed", severity
+        if abs(percent_change) > rule.threshold:
+            return True, f"Absolute percentage change above {rule.threshold:g}%", severity
+        return False, "Within percentage threshold", severity
+
+    raise ValueError(f"Unsupported rule type: {rule.rule_type}")
+
+
+def compare_dataset(previous: LoadedDataset, current: LoadedDataset) -> ComparisonResult:
+    config = previous.config
+    keys = list(config.keys)
+    value_columns = list(config.values.keys())
+
+    merged = previous.aggregated.merge(
+        current.aggregated,
+        on=keys,
+        how="outer",
+        suffixes=(" Previous", " Current"),
+        indicator=True,
+    )
+
+    missing_rows = merged.loc[merged["_merge"] == "left_only", keys].copy()
+    for column in value_columns:
+        missing_rows[f"Previous {column}"] = merged.loc[merged["_merge"] == "left_only", f"{column} Previous"].values
+    if not missing_rows.empty:
+        missing_rows.insert(0, "Status", "MISSING FROM CURRENT")
+
+    new_rows = merged.loc[merged["_merge"] == "right_only", keys].copy()
+    for column in value_columns:
+        new_rows[f"Current {column}"] = merged.loc[merged["_merge"] == "right_only", f"{column} Current"].values
+    if not new_rows.empty:
+        new_rows.insert(0, "Status", "NEW IN CURRENT")
+
+    previous_entities = set(previous.aggregated[config.entity_column].dropna().astype(str))
+    current_entities = set(current.aggregated[config.entity_column].dropna().astype(str))
+
+    missing_entities = pd.DataFrame(
+        {config.entity_column: sorted(previous_entities - current_entities)}
+    )
+    if not missing_entities.empty:
+        missing_entities.insert(0, "Status", "MISSING FROM CURRENT")
+
+    new_entities = pd.DataFrame(
+        {config.entity_column: sorted(current_entities - previous_entities)}
+    )
+    if not new_entities.empty:
+        new_entities.insert(0, "Status", "NEW IN CURRENT")
+
+    matched = merged.loc[merged["_merge"] == "both"].copy()
+    change_frames: List[pd.DataFrame] = []
+
+    for value_column, rule in config.values.items():
+        previous_column = f"{value_column} Previous"
+        current_column = f"{value_column} Current"
+        changed_mask = ~numeric_values_equal(matched[previous_column], matched[current_column])
+        changed = matched.loc[changed_mask, keys + [previous_column, current_column]].copy()
+
+        if changed.empty:
+            continue
+
+        records: List[Dict[str, Any]] = []
+        for _, row in changed.iterrows():
+            previous_value = row[previous_column]
+            current_value = row[current_column]
+            metrics = calculate_change_metrics(previous_value, current_value)
+            is_flagged, reason, severity = evaluate_rule(previous_value, current_value, rule)
+
+            record = {key: row[key] for key in keys}
+            record.update(
+                {
+                    "Value Column": value_column,
+                    "Previous Value": previous_value,
+                    "Current Value": current_value,
+                    **metrics,
+                    "Rule": (
+                        f"More than {rule.threshold:g}x / less than {1 / rule.threshold:g}x"
+                        if rule.rule_type == "ratio"
+                        else f"Absolute change above {rule.threshold:g}%"
+                    ),
+                    "Flagged": "YES" if is_flagged else "NO",
+                    "Flag Reason": reason,
+                    "Severity Score": severity,
+                }
+            )
+            records.append(record)
+
+        change_frames.append(pd.DataFrame.from_records(records))
+
+    if change_frames:
+        all_value_changes = pd.concat(change_frames, ignore_index=True)
+        flagged_order = pd.Categorical(
+            all_value_changes["Flagged"],
+            categories=["YES", "NO"],
+            ordered=True,
+        )
+        all_value_changes = (
+            all_value_changes.assign(_flagged_order=flagged_order)
+            .sort_values(
+                ["_flagged_order", "Severity Score", "Value Column"],
+                ascending=[True, False, True],
+                kind="stable",
+            )
+            .drop(columns="_flagged_order")
+            .reset_index(drop=True)
+        )
+    else:
+        all_value_changes = pd.DataFrame(
+            columns=[
+                *keys,
+                "Value Column",
+                "Previous Value",
+                "Current Value",
+                "Absolute Change",
+                "Percentage Change",
+                "Magnitude Ratio",
+                "Rule",
+                "Flagged",
+                "Flag Reason",
+                "Severity Score",
+            ]
+        )
+
+    flagged_value_changes = all_value_changes.loc[
+        all_value_changes["Flagged"] == "YES"
+    ].copy()
+    if not flagged_value_changes.empty:
+        flagged_value_changes.insert(0, "Status", "FLAGGED CHANGE")
+
+    return ComparisonResult(
+        config=config,
+        previous=previous,
+        current=current,
+        missing_rows=missing_rows.reset_index(drop=True),
+        new_rows=new_rows.reset_index(drop=True),
+        missing_entities=missing_entities.reset_index(drop=True),
+        new_entities=new_entities.reset_index(drop=True),
+        all_value_changes=all_value_changes,
+        flagged_value_changes=flagged_value_changes.reset_index(drop=True),
+        matched_row_count=len(matched),
+    )
+
+
+# =============================================================================
+# CROSS-FILE RECONCILIATION
+# =============================================================================
+
+
+def reconcile_demand(
+    demand: LoadedDataset,
+    loadcap: LoadedDataset,
+    snapshot: str,
+) -> pd.DataFrame:
+    demand_grouped = (
+        demand.prepared.dropna(subset=list(RECONCILIATION_KEYS))
+        .groupby(list(RECONCILIATION_KEYS), dropna=False)["Demand (FTE)"]
+        .sum(min_count=1)
+        .rename("Programme Demand Total (FTE)")
+        .reset_index()
+    )
+
+    loadcap_grouped = (
+        loadcap.prepared.dropna(subset=list(RECONCILIATION_KEYS))
+        .groupby(list(RECONCILIATION_KEYS), dropna=False)["JP Demand (FTE)"]
+        .sum(min_count=1)
+        .rename("LoadCap JP Demand Total (FTE)")
+        .reset_index()
+    )
+
+    reconciled = demand_grouped.merge(
+        loadcap_grouped,
+        on=list(RECONCILIATION_KEYS),
+        how="outer",
+        indicator=True,
+    )
+    reconciled.insert(0, "Snapshot", snapshot)
+
+    reconciled["Difference (Programme - LoadCap)"] = (
+        reconciled["Programme Demand Total (FTE)"]
+        - reconciled["LoadCap JP Demand Total (FTE)"]
+    )
+    reconciled["Absolute Difference (FTE)"] = reconciled[
+        "Difference (Programme - LoadCap)"
+    ].abs()
+
+    programme_total = reconciled["Programme Demand Total (FTE)"]
+    reconciled["Percentage Difference vs Programme Demand"] = np.where(
+        programme_total.notna() & ~np.isclose(programme_total.fillna(0), 0.0),
+        (reconciled["Difference (Programme - LoadCap)"] / programme_total.abs()) * 100.0,
+        np.nan,
+    )
+
+    status = np.select(
+        [
+            reconciled["_merge"] == "left_only",
+            reconciled["_merge"] == "right_only",
+            reconciled["Absolute Difference (FTE)"] > RECONCILIATION_TOLERANCE_FTE,
+        ],
+        [
+            "MISSING FROM LOADCAP",
+            "MISSING FROM PROGRAMME DEMAND",
+            "MISMATCH",
+        ],
+        default="PASS",
+    )
+    reconciled.insert(1, "Status", status)
+    reconciled = reconciled.drop(columns="_merge")
+
+    status_order = pd.Categorical(
+        reconciled["Status"],
+        categories=[
+            "MISSING FROM LOADCAP",
+            "MISSING FROM PROGRAMME DEMAND",
+            "MISMATCH",
+            "PASS",
+        ],
+        ordered=True,
+    )
+    reconciled = (
+        reconciled.assign(_status_order=status_order)
+        .sort_values(
+            ["_status_order", "Absolute Difference (FTE)", *RECONCILIATION_KEYS],
+            ascending=[True, False, True, True],
+            kind="stable",
+        )
+        .drop(columns="_status_order")
+        .reset_index(drop=True)
+    )
+    return reconciled
+
+
+# =============================================================================
+# HTML REPORT
+# =============================================================================
+
+
+def safe_id(text: str) -> str:
+    return "".join(character.lower() if character.isalnum() else "-" for character in text).strip("-")
+
+
+def format_dataframe_for_html(df: pd.DataFrame) -> pd.DataFrame:
+    formatted = df.copy()
+
+    for column in formatted.columns:
+        if pd.api.types.is_numeric_dtype(formatted[column]):
+            if "Percentage" in column or column == "Percentage Change":
+                formatted[column] = formatted[column].map(
+                    lambda value: "" if pd.isna(value) else f"{value:,.2f}%"
+                )
+            elif "Ratio" in column or column == "Severity Score":
+                formatted[column] = formatted[column].map(
+                    lambda value: (
+                        ""
+                        if pd.isna(value)
+                        else "∞"
+                        if np.isinf(value)
+                        else f"{value:,.2f}"
+                    )
+                )
+            elif column in {"Source Excel Row", "Duplicate Row Count"}:
+                formatted[column] = formatted[column].map(
+                    lambda value: "" if pd.isna(value) else f"{int(value)}"
+                )
+            else:
+                formatted[column] = formatted[column].map(
+                    lambda value: "" if pd.isna(value) else f"{value:,.4f}".rstrip("0").rstrip(".")
+                )
+        else:
+            formatted[column] = formatted[column].map(
+                lambda value: "" if pd.isna(value) else str(value)
+            )
+
+    return formatted
+
+
+def render_table(
+    title: str,
+    df: pd.DataFrame,
+    description: str = "",
+    open_by_default: bool = False,
+) -> str:
+    table_id = safe_id(title) + "-" + str(abs(hash(title)) % 100000)
+    full_count = len(df)
+    displayed = df.head(MAX_HTML_ROWS_PER_TABLE).copy()
+    truncated = full_count > len(displayed)
+
+    if df.empty:
+        body = '<div class="empty-state">No issues found.</div>'
+    else:
+        formatted = format_dataframe_for_html(displayed)
+        table_html = formatted.to_html(
+            index=False,
+            border=0,
+            classes="qa-table",
+            table_id=table_id,
+            escape=True,
+        )
+        truncation_note = (
+            f'<div class="warning-note">Showing the first {len(displayed):,} of {full_count:,} rows. '
+            f'Increase <code>MAX_HTML_ROWS_PER_TABLE</code> in the script to display more.</div>'
+            if truncated
+            else ""
+        )
+        body = (
+            f'<div class="table-toolbar">'
+            f'<input class="table-search" type="search" placeholder="Filter this table..." '
+            f'oninput="filterTable(\'{table_id}\', this.value)">'
+            f'<span>{full_count:,} row(s)</span>'
+            f'</div>{truncation_note}<div class="table-wrap">{table_html}</div>'
+        )
+
+    description_html = f'<p class="section-description">{html.escape(description)}</p>' if description else ""
+    open_attribute = " open" if open_by_default else ""
+    return (
+        f'<details class="report-section"{open_attribute}>'
+        f'<summary><span>{html.escape(title)}</span><span class="count-pill">{full_count:,}</span></summary>'
+        f'<div class="section-content">{description_html}{body}</div>'
+        f'</details>'
+    )
+
+
+def status_count(df: pd.DataFrame, status: str) -> int:
+    if "Status" not in df.columns:
+        return 0
+    return int((df["Status"] == status).sum())
+
+
+def build_summary_rows(
+    comparisons: Sequence[ComparisonResult],
+    previous_reconciliation: pd.DataFrame,
+    current_reconciliation: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+
+    for result in comparisons:
+        config = result.config
+        rows.extend(
+            [
+                {
+                    "Area": config.name,
+                    "Check": "Missing detailed rows",
+                    "Count": len(result.missing_rows),
+                    "Result": "PASS" if result.missing_rows.empty else "ISSUES",
+                },
+                {
+                    "Area": config.name,
+                    "Check": f"Missing {config.entity_column} values",
+                    "Count": len(result.missing_entities),
+                    "Result": "PASS" if result.missing_entities.empty else "ISSUES",
+                },
+                {
+                    "Area": config.name,
+                    "Check": "Flagged value changes",
+                    "Count": len(result.flagged_value_changes),
+                    "Result": "PASS" if result.flagged_value_changes.empty else "ISSUES",
+                },
+                {
+                    "Area": config.name,
+                    "Check": "Previous duplicate rows",
+                    "Count": len(result.previous.duplicates),
+                    "Result": "PASS" if result.previous.duplicates.empty else "ISSUES",
+                },
+                {
+                    "Area": config.name,
+                    "Check": "Current duplicate rows",
+                    "Count": len(result.current.duplicates),
+                    "Result": "PASS" if result.current.duplicates.empty else "ISSUES",
+                },
+                {
+                    "Area": config.name,
+                    "Check": "Blank key rows",
+                    "Count": len(result.previous.blank_key_issues) + len(result.current.blank_key_issues),
+                    "Result": (
+                        "PASS"
+                        if result.previous.blank_key_issues.empty and result.current.blank_key_issues.empty
+                        else "ISSUES"
+                    ),
+                },
+                {
+                    "Area": config.name,
+                    "Check": "Invalid numeric values",
+                    "Count": len(result.previous.numeric_issues) + len(result.current.numeric_issues),
+                    "Result": (
+                        "PASS"
+                        if result.previous.numeric_issues.empty and result.current.numeric_issues.empty
+                        else "ISSUES"
+                    ),
+                },
+            ]
+        )
+
+    for snapshot, reconciliation in (
+        ("Previous", previous_reconciliation),
+        ("Current", current_reconciliation),
+    ):
+        issue_count = int((reconciliation["Status"] != "PASS").sum())
+        rows.append(
+            {
+                "Area": f"Demand Reconciliation ({snapshot})",
+                "Check": f"Year Quarter + HoC mismatches above {RECONCILIATION_TOLERANCE_FTE:g} FTE",
+                "Count": issue_count,
+                "Result": "PASS" if issue_count == 0 else "ISSUES",
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def metric_card(label: str, value: Any, variant: str = "neutral") -> str:
+    return (
+        f'<div class="metric-card {html.escape(variant)}">'
+        f'<div class="metric-value">{html.escape(str(value))}</div>'
+        f'<div class="metric-label">{html.escape(label)}</div>'
+        f'</div>'
+    )
+
+
+def build_report_html(
+    comparisons: Sequence[ComparisonResult],
+    previous_reconciliation: pd.DataFrame,
+    current_reconciliation: pd.DataFrame,
+) -> str:
+    generated_at = datetime.now().astimezone()
+    summary = build_summary_rows(comparisons, previous_reconciliation, current_reconciliation)
+    total_issues = int(summary.loc[summary["Result"] == "ISSUES", "Count"].sum())
+    failed_checks = int((summary["Result"] == "ISSUES").sum())
+    passed_checks = int((summary["Result"] == "PASS").sum())
+    overall_status = "PASS" if failed_checks == 0 else "REVIEW REQUIRED"
+
+    file_rows: List[Dict[str, Any]] = []
+    for result in comparisons:
+        for loaded in (result.previous, result.current):
+            file_rows.append(
+                {
+                    "Dataset": loaded.config.name,
+                    "Snapshot": loaded.snapshot,
+                    "File": str(loaded.path),
+                    "Worksheet": loaded.sheet_name,
+                    "Raw Rows": loaded.raw_row_count,
+                    "Aggregated Key Rows": len(loaded.aggregated),
+                }
+            )
+    file_table = pd.DataFrame(file_rows)
+
+    metric_cards = "".join(
+        [
+            metric_card("Overall status", overall_status, "good" if failed_checks == 0 else "bad"),
+            metric_card("Checks passed", f"{passed_checks:,}", "good"),
+            metric_card("Checks needing review", f"{failed_checks:,}", "bad" if failed_checks else "good"),
+            metric_card("Total issue records", f"{total_issues:,}", "bad" if total_issues else "good"),
+        ]
+    )
+
+    nav_links = ['<a href="#summary">Summary</a>']
+    for result in comparisons:
+        nav_links.append(f'<a href="#{safe_id(result.config.code)}">{html.escape(result.config.name)}</a>')
+    nav_links.append('<a href="#reconciliation">Demand reconciliation</a>')
+
+    dataset_sections: List[str] = []
+    for result in comparisons:
+        config = result.config
+        combined_duplicates = pd.concat(
+            [result.previous.duplicates, result.current.duplicates],
+            ignore_index=True,
+        )
+        combined_blank_keys = pd.concat(
+            [result.previous.blank_key_issues, result.current.blank_key_issues],
+            ignore_index=True,
+        )
+        combined_numeric_issues = pd.concat(
+            [result.previous.numeric_issues, result.current.numeric_issues],
+            ignore_index=True,
+        )
+
+        dataset_sections.append(
+            f'<section id="{safe_id(config.code)}" class="dataset-block">'
+            f'<div class="dataset-heading">'
+            f'<div><h2>{html.escape(config.name)}</h2>'
+            f'<p>Keys: {html.escape(" + ".join(config.keys))}</p></div>'
+            f'<a class="back-link" href="#top">Back to top ↑</a>'
+            f'</div>'
+            + render_table(
+                f"{config.name}: Flagged value changes",
+                result.flagged_value_changes,
+                "Only changes that breach the configured 2x or 25% threshold are shown here.",
+                open_by_default=True,
+            )
+            + render_table(
+                f"{config.name}: Missing detailed rows",
+                result.missing_rows,
+                "Key combinations present previously but absent from the current file.",
+                open_by_default=True,
+            )
+            + render_table(
+                f"{config.name}: Missing {config.entity_column} values",
+                result.missing_entities,
+                f"Distinct {config.entity_column} values that existed previously but do not appear anywhere in the current file.",
+                open_by_default=True,
+            )
+            + render_table(
+                f"{config.name}: New detailed rows",
+                result.new_rows,
+                "Key combinations that appear in the current file but not the previous file.",
+            )
+            + render_table(
+                f"{config.name}: New {config.entity_column} values",
+                result.new_entities,
+                f"Distinct {config.entity_column} values that are new in the current file.",
+            )
+            + render_table(
+                f"{config.name}: All changed values",
+                result.all_value_changes,
+                "Every numeric change on a matched key, including changes within the accepted threshold.",
+            )
+            + render_table(
+                f"{config.name}: Duplicate identifier rows",
+                combined_duplicates,
+                "Duplicate keys are reported before aggregation. Numeric comparisons aggregate duplicates using the configured sum or mean rule.",
+            )
+            + render_table(
+                f"{config.name}: Blank identifier fields",
+                combined_blank_keys,
+                "Rows with any blank key field are excluded from key-based comparison and shown here for correction.",
+            )
+            + render_table(
+                f"{config.name}: Invalid numeric values",
+                combined_numeric_issues,
+                "Values that could not be converted to numbers. These become blank for comparison purposes.",
+            )
+            + "</section>"
+        )
+
+    previous_issues = previous_reconciliation.loc[previous_reconciliation["Status"] != "PASS"].copy()
+    current_issues = current_reconciliation.loc[current_reconciliation["Status"] != "PASS"].copy()
+
+    reconciliation_section = (
+        '<section id="reconciliation" class="dataset-block">'
+        '<div class="dataset-heading"><div><h2>Programme Demand vs LoadCap reconciliation</h2>'
+        '<p>Programme Demand (Demand (FTE)) and LoadCap (JP Demand (FTE)) are independently aggregated by Year Quarter + HoC.</p>'
+        '</div><a class="back-link" href="#top">Back to top ↑</a></div>'
+        + render_table(
+            "Current reconciliation issues",
+            current_issues,
+            f"Current totals differing by more than {RECONCILIATION_TOLERANCE_FTE:g} FTE, or keys missing from either current file.",
+            open_by_default=True,
+        )
+        + render_table(
+            "Previous reconciliation issues",
+            previous_issues,
+            f"Previous totals differing by more than {RECONCILIATION_TOLERANCE_FTE:g} FTE, or keys missing from either previous file.",
+            open_by_default=True,
+        )
+        + render_table(
+            "Current full reconciliation",
+            current_reconciliation,
+            "All current Year Quarter + HoC totals, including passing rows.",
+        )
+        + render_table(
+            "Previous full reconciliation",
+            previous_reconciliation,
+            "All previous Year Quarter + HoC totals, including passing rows.",
+        )
+        + "</section>"
+    )
+
+    css = """
+    :root {
+        color-scheme: light;
+        --bg: #f4f6f8;
+        --surface: #ffffff;
+        --text: #17202a;
+        --muted: #5f6b76;
+        --border: #d9e0e6;
+        --accent: #22577a;
+        --accent-soft: #eaf3f8;
+        --good: #176b3a;
+        --good-bg: #e8f6ee;
+        --bad: #9d2235;
+        --bad-bg: #fdecef;
+        --warn: #8a5a00;
+        --warn-bg: #fff5da;
+        --shadow: 0 6px 18px rgba(22, 34, 46, 0.08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, "Segoe UI", Arial, sans-serif;
+        line-height: 1.45;
+    }
+    header {
+        background: linear-gradient(135deg, #173b57, #22577a);
+        color: white;
+        padding: 36px max(24px, calc((100vw - 1500px) / 2));
+    }
+    header h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 44px); }
+    header p { margin: 4px 0; opacity: 0.9; }
+    nav {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        padding: 10px max(24px, calc((100vw - 1500px) / 2));
+        background: rgba(255, 255, 255, 0.96);
+        border-bottom: 1px solid var(--border);
+        backdrop-filter: blur(8px);
+    }
+    nav a, .back-link {
+        color: var(--accent);
+        text-decoration: none;
+        font-weight: 600;
+    }
+    nav a {
+        padding: 7px 10px;
+        border-radius: 7px;
+    }
+    nav a:hover { background: var(--accent-soft); }
+    main {
+        max-width: 1500px;
+        margin: 0 auto;
+        padding: 24px;
+    }
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+        gap: 14px;
+        margin: 0 0 24px;
+    }
+    .metric-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 18px;
+        box-shadow: var(--shadow);
+    }
+    .metric-card.good { border-left: 6px solid var(--good); }
+    .metric-card.bad { border-left: 6px solid var(--bad); }
+    .metric-value { font-size: 26px; font-weight: 750; }
+    .metric-label { color: var(--muted); margin-top: 4px; }
+    .dataset-block {
+        margin: 24px 0 40px;
+        scroll-margin-top: 75px;
+    }
+    .dataset-heading {
+        display: flex;
+        justify-content: space-between;
+        align-items: end;
+        gap: 16px;
+        margin-bottom: 12px;
+    }
+    .dataset-heading h2 { margin: 0; font-size: 28px; }
+    .dataset-heading p { margin: 5px 0 0; color: var(--muted); }
+    .report-section {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        margin: 10px 0;
+        box-shadow: 0 2px 8px rgba(22, 34, 46, 0.05);
+        overflow: hidden;
+    }
+    .report-section summary {
+        cursor: pointer;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        padding: 14px 16px;
+        font-weight: 700;
+        background: #fbfcfd;
+        user-select: none;
+    }
+    .report-section[open] summary { border-bottom: 1px solid var(--border); }
+    .count-pill {
+        min-width: 38px;
+        text-align: center;
+        padding: 3px 9px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 13px;
+    }
+    .section-content { padding: 16px; }
+    .section-description { margin: 0 0 12px; color: var(--muted); }
+    .table-toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 14px;
+    }
+    .table-search {
+        width: min(360px, 100%);
+        padding: 9px 11px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+        font: inherit;
+    }
+    .table-wrap {
+        overflow: auto;
+        max-height: 650px;
+        border: 1px solid var(--border);
+        border-radius: 7px;
+    }
+    table.qa-table {
+        border-collapse: separate;
+        border-spacing: 0;
+        width: 100%;
+        min-width: 760px;
+        font-size: 13px;
+    }
+    .qa-table th, .qa-table td {
+        padding: 8px 10px;
+        border-right: 1px solid var(--border);
+        border-bottom: 1px solid var(--border);
+        text-align: left;
+        white-space: nowrap;
+    }
+    .qa-table th:last-child, .qa-table td:last-child { border-right: 0; }
+    .qa-table tr:last-child td { border-bottom: 0; }
+    .qa-table th {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: #eef3f6;
+        color: #22313f;
+        font-weight: 700;
+    }
+    .qa-table tbody tr:nth-child(even) { background: #fafbfc; }
+    .qa-table tbody tr:hover { background: #edf6fb; }
+    td.cell-pass, td.cell-no { background: var(--good-bg); color: var(--good); font-weight: 700; }
+    td.cell-issue, td.cell-yes, td.cell-mismatch, td.cell-missing { background: var(--bad-bg); color: var(--bad); font-weight: 700; }
+    .empty-state {
+        padding: 18px;
+        border: 1px dashed #9fb6a9;
+        background: var(--good-bg);
+        color: var(--good);
+        border-radius: 7px;
+        font-weight: 650;
+    }
+    .warning-note {
+        padding: 10px 12px;
+        margin-bottom: 10px;
+        border-radius: 7px;
+        background: var(--warn-bg);
+        color: var(--warn);
+    }
+    code { background: #eef1f4; padding: 2px 5px; border-radius: 4px; }
+    footer {
+        max-width: 1500px;
+        margin: 0 auto;
+        padding: 8px 24px 36px;
+        color: var(--muted);
+    }
+    @media (max-width: 700px) {
+        main { padding: 14px; }
+        .dataset-heading { align-items: start; flex-direction: column; }
+        .table-toolbar { align-items: stretch; flex-direction: column; }
+        .table-search { width: 100%; }
+    }
+    """
+
+    javascript = """
+    function filterTable(tableId, query) {
+        const table = document.getElementById(tableId);
+        if (!table) return;
+        const normalised = query.toLowerCase();
+        const rows = table.tBodies[0].rows;
+        for (const row of rows) {
+            row.style.display = row.innerText.toLowerCase().includes(normalised) ? "" : "none";
+        }
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+        const issueWords = [
+            "ISSUES", "YES", "MISMATCH", "MISSING FROM CURRENT", "MISSING FROM LOADCAP",
+            "MISSING FROM PROGRAMME DEMAND", "FLAGGED CHANGE"
+        ];
+        const passWords = ["PASS", "NO"];
+
+        for (const cell of document.querySelectorAll("td")) {
+            const value = cell.textContent.trim().toUpperCase();
+            if (passWords.includes(value)) {
+                cell.classList.add(value === "PASS" ? "cell-pass" : "cell-no");
+            } else if (issueWords.includes(value)) {
+                if (value === "YES" || value === "FLAGGED CHANGE") cell.classList.add("cell-yes");
+                else if (value === "MISMATCH" || value === "ISSUES") cell.classList.add("cell-mismatch");
+                else cell.classList.add("cell-missing");
+            }
+        }
+    });
+    """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transformation QA Report</title>
+<style>{css}</style>
+</head>
+<body id="top">
+<header>
+    <h1>Transformation QA Report</h1>
+    <p>Generated {html.escape(generated_at.strftime('%d %B %Y at %H:%M:%S %Z'))}</p>
+    <p>Overall result: <strong>{html.escape(overall_status)}</strong></p>
+</header>
+<nav>{''.join(nav_links)}</nav>
+<main>
+    <section id="summary" class="dataset-block">
+        <div class="metric-grid">{metric_cards}</div>
+        <div class="dataset-heading"><div><h2>QA summary</h2><p>Counts are based on complete result sets, even when a displayed detail table is capped.</p></div></div>
+        {render_table('Summary checks', summary, open_by_default=True)}
+        {render_table('Selected files and worksheets', file_table, open_by_default=True)}
+    </section>
+    {''.join(dataset_sections)}
+    {reconciliation_section}
+</main>
+<footer>
+    Thresholds used: 2x magnitude rule for Demand and LoadCap; greater than 25% absolute change for skills; reconciliation tolerance {RECONCILIATION_TOLERANCE_FTE:g} FTE.
+</footer>
+<script>{javascript}</script>
+</body>
+</html>
+"""
+
+
+# =============================================================================
+# COMMAND-LINE AND APPLICATION FLOW
+# =============================================================================
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Compare previous/current transformation Excel outputs and generate an HTML QA report."
+    )
+
+    for config in DATASETS:
+        argument_prefix = config.code.replace("_", "-")
+        parser.add_argument(f"--{argument_prefix}-previous", type=Path)
+        parser.add_argument(f"--{argument_prefix}-current", type=Path)
+        parser.add_argument(f"--{argument_prefix}-previous-sheet")
+        parser.add_argument(f"--{argument_prefix}-current-sheet")
+
+    parser.add_argument("--output", type=Path, help="HTML report output path.")
+    parser.add_argument("--no-open", action="store_true", help="Do not automatically open the report.")
+    return parser
+
+
+def get_argument_value(args: argparse.Namespace, config: DatasetConfig, suffix: str) -> Any:
+    return getattr(args, f"{config.code}_{suffix}")
+
+
+def resolve_inputs(args: argparse.Namespace, root: Optional[Any]) -> Tuple[Dict[str, Dict[str, Any]], Path]:
+    resolved: Dict[str, Dict[str, Any]] = {}
+
+    for config in DATASETS:
+        previous_path = get_argument_value(args, config, "previous")
+        current_path = get_argument_value(args, config, "current")
+
+        if previous_path is None:
+            if root is None:
+                raise ValueError(
+                    f"No previous file provided for {config.name}. Use --{config.code.replace('_', '-')}-previous."
+                )
+            previous_path = choose_excel_file(
+                root,
+                f"Select PREVIOUS {config.name} file",
+                config.expected_filename,
+            )
+
+        if current_path is None:
+            if root is None:
+                raise ValueError(
+                    f"No current file provided for {config.name}. Use --{config.code.replace('_', '-')}-current."
+                )
+            current_path = choose_excel_file(
+                root,
+                f"Select CURRENT {config.name} file",
+                config.expected_filename,
+            )
+
+        previous_path = Path(previous_path).expanduser().resolve()
+        current_path = Path(current_path).expanduser().resolve()
+
+        if not previous_path.exists():
+            raise FileNotFoundError(f"Previous {config.name} file does not exist: {previous_path}")
+        if not current_path.exists():
+            raise FileNotFoundError(f"Current {config.name} file does not exist: {current_path}")
+
+        previous_sheet = choose_sheet(
+            root,
+            previous_path,
+            f"previous {config.name}",
+            get_argument_value(args, config, "previous_sheet"),
+        )
+        current_sheet = choose_sheet(
+            root,
+            current_path,
+            f"current {config.name}",
+            get_argument_value(args, config, "current_sheet"),
+        )
+
+        resolved[config.code] = {
+            "previous_path": previous_path,
+            "current_path": current_path,
+            "previous_sheet": previous_sheet,
+            "current_sheet": current_sheet,
+        }
+
+    output = args.output
+    if output is None:
+        if root is None:
+            output = Path.cwd() / f"Transformation_QA_Report_{datetime.now():%Y%m%d_%H%M%S}.html"
+        else:
+            output = choose_output_file(root)
+
+    output = Path(output).expanduser().resolve()
+    if output.suffix.lower() not in {".html", ".htm"}:
+        output = output.with_suffix(".html")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    return resolved, output
+
+
+def run_qa(resolved_inputs: Dict[str, Dict[str, Any]], output_path: Path) -> Path:
+    comparisons: List[ComparisonResult] = []
+    loaded_by_code: Dict[str, Dict[str, LoadedDataset]] = {}
+
+    for config in DATASETS:
+        selected = resolved_inputs[config.code]
+        previous = load_dataset(
+            config,
+            "Previous",
+            selected["previous_path"],
+            selected["previous_sheet"],
+        )
+        current = load_dataset(
+            config,
+            "Current",
+            selected["current_path"],
+            selected["current_sheet"],
+        )
+        loaded_by_code[config.code] = {"previous": previous, "current": current}
+        comparisons.append(compare_dataset(previous, current))
+
+    previous_reconciliation = reconcile_demand(
+        loaded_by_code["programme_demand"]["previous"],
+        loaded_by_code["loadcap"]["previous"],
+        "Previous",
+    )
+    current_reconciliation = reconcile_demand(
+        loaded_by_code["programme_demand"]["current"],
+        loaded_by_code["loadcap"]["current"],
+        "Current",
+    )
+
+    report_html = build_report_html(
+        comparisons,
+        previous_reconciliation,
+        current_reconciliation,
+    )
+    output_path.write_text(report_html, encoding="utf-8")
+    return output_path
+
+
+def show_error(root: Optional[Any], title: str, message: str) -> None:
+    if root is not None and messagebox is not None:
+        messagebox.showerror(title, message, parent=root)
+    else:
+        print(f"{title}: {message}", file=sys.stderr)
+
+
+def show_success(root: Optional[Any], report_path: Path) -> None:
+    message = f"QA report created successfully:\n\n{report_path}"
+    if root is not None and messagebox is not None:
+        messagebox.showinfo("QA report complete", message, parent=root)
+    else:
+        print(message)
+
+
+def main() -> int:
+    parser = build_argument_parser()
+    args = parser.parse_args()
+
+    needs_gui = any(
+        get_argument_value(args, config, suffix) is None
+        for config in DATASETS
+        for suffix in ("previous", "current")
+    ) or args.output is None
+
+    root: Optional[Any] = None
+    if needs_gui:
+        if tk is None:
+            parser.error(
+                "Tkinter is unavailable, so file-picker mode cannot be used. "
+                "Provide all file paths and --output on the command line."
+            )
+        root = create_hidden_root()
+
+    try:
+        resolved_inputs, output_path = resolve_inputs(args, root)
+        report_path = run_qa(resolved_inputs, output_path)
+        show_success(root, report_path)
+
+        if AUTO_OPEN_REPORT and not args.no_open:
+            webbrowser.open(report_path.as_uri())
+        return 0
+
+    except UserCancelledError as exc:
+        print(str(exc))
+        return 1
+    except Exception as exc:
+        detailed_message = f"{exc}\n\nTechnical details:\n{traceback.format_exc()}"
+        show_error(root, "QA report failed", detailed_message)
+        return 1
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
