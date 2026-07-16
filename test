@@ -1,409 +1,123 @@
-let
-    // Change this to your network file path.
-    // Prefer UNC format like \\server\folder\file.xlsx instead of mapped drive like Z:\folder\file.xlsx
-    FilePath = "\\server\folder\file.xlsx",
+WITH RagValues AS
+(
+    SELECT
+        t.Capability,
+        t.ToolName,
+        rag.RagValue
+    FROM dbo.ToolHealth AS t
 
-    // Load workbook
-    Workbook =
-        Excel.Workbook(
-            File.Contents(FilePath),
-            null,
-            true
-        ),
+    CROSS APPLY
+    (
+        VALUES
+            (t.RAG_Column_1),
+            (t.RAG_Column_2),
+            (t.RAG_Column_3),
+            (t.RAG_Column_4),
+            (t.RAG_Column_5),
+            (t.RAG_Column_6),
+            (t.RAG_Column_7),
+            (t.RAG_Column_8),
+            (t.RAG_Column_9),
+            (t.RAG_Column_10),
+            (t.RAG_Column_11)
+    ) AS rag(RagValue)
+),
 
-    // Keep worksheets only
-    SheetsOnly =
-        Table.SelectRows(
-            Workbook,
-            each [Kind] = "Sheet"
-                and (try [Hidden] otherwise false) <> true
-        ),
+CapabilityScores AS
+(
+    SELECT
+        Capability,
 
-    // Keep only sheet name and nested sheet data
-    KeptNameAndData =
-        Table.SelectColumns(
-            SheetsOnly,
-            {"Name", "Data"}
-        ),
+        SUM(
+            CASE
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('G', 'GREEN')
+                    THEN 3
 
-    // These are the metadata fields to pull from Column 3,
-    // with the adjacent value from Column 4
-    FieldsToExtract =
-        {
-            "Position",
-            "Generic Job Profile",
-            "Job Family or Capability Group",
-            "Job Profile Identification"
-        },
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('A', 'AMBER')
+                    THEN 2
 
-    // Lowercase labels that indicate the start of the skills section
-    SkillHeaderLabels =
-        {
-            "skills",
-            "evidence based skills",
-            "core technical skills"
-        },
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('R', 'RED')
+                    THEN 0
 
-    // Lowercase labels that indicate the end of the skills section
-    SkillEndLabels =
-        {
-            "role specific dimensions"
-        },
+                /* Null or empty values count as Blank */
+                ELSE 1
+            END
+        ) AS AchievedPoints,
 
-    // Simple reusable text cleaner
-    CleanText = (InputValue as any) as nullable text =>
-        let
-            Output =
-                if InputValue = null then
-                    null
-                else
-                    let
-                        AsText = Text.From(InputValue),
-                        Cleaned = Text.Trim(Text.Clean(AsText))
-                    in
-                        if Cleaned = "" then null else Cleaned
-        in
-            Output,
+        COUNT(*) * 3 AS MaximumPoints,
 
-    // Lowercase cleaner for comparisons
-    CleanLower = (InputValue as any) as nullable text =>
-        let
-            Cleaned = CleanText(InputValue),
-            Output =
-                if Cleaned = null then
-                    null
-                else
-                    Text.Lower(Cleaned)
-        in
-            Output,
+        SUM(
+            CASE
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('G', 'GREEN')
+                    THEN 1
+                ELSE 0
+            END
+        ) AS GreenCount,
 
-    // Function to take columns 3 and 4 from each sheet
-    ExtractColumns3And4 = (SheetName as text, SheetData as table) as table =>
-        let
-            ColumnNames =
-                Table.ColumnNames(SheetData),
+        SUM(
+            CASE
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('A', 'AMBER')
+                    THEN 1
+                ELSE 0
+            END
+        ) AS AmberCount,
 
-            HasEnoughColumns =
-                List.Count(ColumnNames) >= 4,
+        SUM(
+            CASE
+                WHEN UPPER(LTRIM(RTRIM(COALESCE(RagValue, ''))))
+                    IN ('R', 'RED')
+                    THEN 1
+                ELSE 0
+            END
+        ) AS RedCount,
 
-            Output =
-                if HasEnoughColumns = false then
-                    #table(
-                        {"Source Sheet", "Label", "Value"},
-                        {}
-                    )
-                else
-                    let
-                        Column3Name =
-                            ColumnNames{2},
+        SUM(
+            CASE
+                WHEN NULLIF(LTRIM(RTRIM(RagValue)), '') IS NULL
+                    THEN 1
+                ELSE 0
+            END
+        ) AS BlankCount
 
-                        Column4Name =
-                            ColumnNames{3},
+    FROM RagValues
 
-                        SelectedColumns =
-                            Table.SelectColumns(
-                                SheetData,
-                                {Column3Name, Column4Name},
-                                MissingField.UseNull
-                            ),
+    GROUP BY
+        Capability
+)
 
-                        RenamedColumns =
-                            Table.RenameColumns(
-                                SelectedColumns,
-                                {
-                                    {Column3Name, "Label"},
-                                    {Column4Name, "Value"}
-                                }
-                            ),
+SELECT
+    Capability,
+    GreenCount,
+    AmberCount,
+    RedCount,
+    BlankCount,
+    AchievedPoints,
+    MaximumPoints,
 
-                        AddedSourceSheet =
-                            Table.AddColumn(
-                                RenamedColumns,
-                                "Source Sheet",
-                                each SheetName,
-                                type text
-                            ),
+    CAST(
+        AchievedPoints * 100.0
+        / NULLIF(MaximumPoints, 0)
+        AS DECIMAL(5, 2)
+    ) AS CapabilityHealthPercentage,
 
-                        ReorderedColumns =
-                            Table.ReorderColumns(
-                                AddedSourceSheet,
-                                {"Source Sheet", "Label", "Value"}
-                            ),
+    CASE
+        WHEN AchievedPoints * 100.0
+             / NULLIF(MaximumPoints, 0) >= 75
+            THEN 'Green'
 
-                        CleanedColumns =
-                            Table.TransformColumns(
-                                ReorderedColumns,
-                                {
-                                    {"Label", each CleanText(_), type nullable text},
-                                    {"Value", each CleanText(_), type nullable text}
-                                }
-                            )
-                    in
-                        CleanedColumns
-        in
-            Output,
+        WHEN AchievedPoints * 100.0
+             / NULLIF(MaximumPoints, 0) >= 50
+            THEN 'Amber'
 
-    // Apply function to every sheet
-    AddedExtractedColumns =
-        Table.AddColumn(
-            KeptNameAndData,
-            "Extracted Data",
-            each ExtractColumns3And4(
-                Text.From([Name]),
-                [Data]
-            ),
-            type table
-        ),
+        ELSE 'Red'
+    END AS CapabilityRAG
 
-    // Combine all sheets into one flat table:
-    // Source Sheet | Label | Value
-    CombinedExtracted =
-        Table.Combine(
-            AddedExtractedColumns[Extracted Data]
-        ),
+FROM CapabilityScores
 
-    // =========================
-    // Metadata extraction
-    // =========================
-
-    MetadataRows =
-        Table.SelectRows(
-            CombinedExtracted,
-            each List.Contains(
-                List.Transform(FieldsToExtract, each Text.Lower(_)),
-                CleanLower([Label])
-            )
-        ),
-
-    MetadataNormalised =
-        Table.AddColumn(
-            MetadataRows,
-            "Metadata Label",
-            each
-                let
-                    CurrentLabel = CleanLower([Label])
-                in
-                    if CurrentLabel = "position" then
-                        "Position"
-                    else if CurrentLabel = "generic job profile" then
-                        "Generic Job Profile"
-                    else if CurrentLabel = "job family or capability group" then
-                        "Job Family or Capability Group"
-                    else if CurrentLabel = "job profile identification" then
-                        "Job Profile Identification"
-                    else
-                        [Label],
-            type text
-        ),
-
-    MetadataKeptColumns =
-        Table.SelectColumns(
-            MetadataNormalised,
-            {"Source Sheet", "Metadata Label", "Value"}
-        ),
-
-    MetadataPivoted =
-        Table.Pivot(
-            MetadataKeptColumns,
-            FieldsToExtract,
-            "Metadata Label",
-            "Value",
-            each try List.First(List.RemoveNulls(_)) otherwise null
-        ),
-
-    MetadataWithAllColumns =
-        List.Accumulate(
-            FieldsToExtract,
-            MetadataPivoted,
-            (CurrentTable, CurrentField) =>
-                if List.Contains(Table.ColumnNames(CurrentTable), CurrentField) then
-                    CurrentTable
-                else
-                    Table.AddColumn(
-                        CurrentTable,
-                        CurrentField,
-                        each null,
-                        type nullable text
-                    )
-        ),
-
-    MetadataFinal =
-        Table.SelectColumns(
-            MetadataWithAllColumns,
-            {"Source Sheet"} & FieldsToExtract
-        ),
-
-    // =========================
-    // Skills extraction
-    // =========================
-
-    GroupedBySheet =
-        Table.Group(
-            CombinedExtracted,
-            {"Source Sheet"},
-            {
-                {
-                    "Skills Data",
-                    each
-                        let
-                            SheetRows =
-                                Table.AddIndexColumn(
-                                    _,
-                                    "RowIndex",
-                                    0,
-                                    1,
-                                    Int64.Type
-                                ),
-
-                            SkillsStartRows =
-                                Table.SelectRows(
-                                    SheetRows,
-                                    each [Label] <> null
-                                        and List.Contains(
-                                            SkillHeaderLabels,
-                                            CleanLower([Label])
-                                        )
-                                ),
-
-                            SkillsStartIndex =
-                                try SkillsStartRows{0}[RowIndex] otherwise null,
-
-                            SkillsEndRows =
-                                if SkillsStartIndex = null then
-                                    #table({"RowIndex"}, {})
-                                else
-                                    Table.SelectRows(
-                                        SheetRows,
-                                        each [RowIndex] > SkillsStartIndex
-                                            and (
-                                                [Label] = null
-                                                or List.Contains(
-                                                    SkillEndLabels,
-                                                    CleanLower([Label])
-                                                )
-                                            )
-                                    ),
-
-                            SkillsEndIndex =
-                                try SkillsEndRows{0}[RowIndex] otherwise null,
-
-                            SkillRows =
-                                if SkillsStartIndex = null then
-                                    #table({"Skill"}, {})
-                                else
-                                    Table.SelectRows(
-                                        SheetRows,
-                                        each [RowIndex] > SkillsStartIndex
-                                            and (
-                                                SkillsEndIndex = null
-                                                or [RowIndex] < SkillsEndIndex
-                                            )
-                                    ),
-
-                            KeptSkillColumn =
-                                if SkillsStartIndex = null then
-                                    #table({"Skill"}, {})
-                                else
-                                    Table.RenameColumns(
-                                        Table.SelectColumns(
-                                            SkillRows,
-                                            {"Label"}
-                                        ),
-                                        {{"Label", "Skill"}}
-                                    ),
-
-                            CleanedSkills =
-                                Table.TransformColumns(
-                                    KeptSkillColumn,
-                                    {
-                                        {"Skill", each CleanText(_), type nullable text}
-                                    }
-                                ),
-
-                            RemovedBlankSkills =
-                                Table.SelectRows(
-                                    CleanedSkills,
-                                    each [Skill] <> null
-                                        and Text.Trim([Skill]) <> ""
-                                        and not List.Contains(
-                                            SkillHeaderLabels,
-                                            CleanLower([Skill])
-                                        )
-                                        and not List.Contains(
-                                            SkillEndLabels,
-                                            CleanLower([Skill])
-                                        )
-                                ),
-
-                            DistinctSkills =
-                                Table.Distinct(RemovedBlankSkills),
-
-                            Output =
-                                if Table.RowCount(DistinctSkills) = 0 then
-                                    #table({"Skill"}, {{null}})
-                                else
-                                    DistinctSkills
-                        in
-                            Output,
-                    type table
-                }
-            }
-        ),
-
-    ExpandedSkills =
-        Table.ExpandTableColumn(
-            GroupedBySheet,
-            "Skills Data",
-            {"Skill"},
-            {"Skill"}
-        ),
-
-    // =========================
-    // Join metadata to skills
-    // =========================
-
-    MergedMetadata =
-        Table.NestedJoin(
-            ExpandedSkills,
-            {"Source Sheet"},
-            MetadataFinal,
-            {"Source Sheet"},
-            "Metadata",
-            JoinKind.LeftOuter
-        ),
-
-    ExpandedMetadata =
-        Table.ExpandTableColumn(
-            MergedMetadata,
-            "Metadata",
-            FieldsToExtract,
-            FieldsToExtract
-        ),
-
-    ReorderedFinalColumns =
-        Table.ReorderColumns(
-            ExpandedMetadata,
-            {
-                "Source Sheet",
-                "Position",
-                "Generic Job Profile",
-                "Job Family or Capability Group",
-                "Job Profile Identification",
-                "Skill"
-            }
-        ),
-
-    Final =
-        Table.TransformColumnTypes(
-            ReorderedFinalColumns,
-            {
-                {"Source Sheet", type text},
-                {"Position", type text},
-                {"Generic Job Profile", type text},
-                {"Job Family or Capability Group", type text},
-                {"Job Profile Identification", type text},
-                {"Skill", type text}
-            }
-        )
-in
-    Final
+ORDER BY
+    Capability;
